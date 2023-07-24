@@ -101,12 +101,10 @@ def _fwd_kernel(
     tl.store(O_block_ptr, acc.to(tl.float16))
 
 
-# @triton.jit
+@triton.jit
 def _bwd_kernel(
-    Q, K, V, sm_scale, Out, DO,
-    DQ, DK, DV,
-    L,
-    D,
+    Q, K, V, Decay, First, Out, DO,
+    DQ, DK, DV, DDecay, DFirst,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vk, stride_vn,
@@ -114,12 +112,14 @@ def _bwd_kernel(
     num_block,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr,
 ):
     off_hz = tl.program_id(0)
     off_z = off_hz // H
     off_h = off_hz % H
-    qk_scale = sm_scale * 1.44269504
+    decay = tl.load(Decay + off_h)
+    first = tl.load(First + off_h)
+    ddecay = 0.
+    dfirst = 0.
     # offset pointers for batch/head
     Q += off_z * stride_qz + off_h * stride_qh
     K += off_z * stride_qz + off_h * stride_qh
@@ -141,9 +141,6 @@ def _bwd_kernel(
         v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        # pointer to row-wise quantities in value-like data
-        D_ptrs = D + off_hz * N_CTX
-        l_ptrs = L + off_hz * N_CTX
         # initialize dv amd dk
         dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
         dk = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
@@ -155,23 +152,25 @@ def _bwd_kernel(
             offs_m_curr = start_m + offs_m
             # load q, k, v, do on-chip
             q = tl.load(q_ptrs)
-            # recompute p = softmax(qk, dim=-1).T
             qk = tl.dot(q, tl.trans(k))
-            qkm = qk
+            powers = (offs_m_curr[:, None] - offs_n[None, :])
+            att_mask = tl.where(powers > 0, tl.math.fast_powf(decay, powers - 1), 0).to(tl.float16)
+            att_mask += tl.where(powers == 0, first, 0)
+            qkm = qk * att_mask
             # compute dv
             do = tl.load(do_ptrs)
             dv += tl.dot(tl.trans(qkm.to(Q.dtype.element_ty)), do)
-            # compute dp = dot(v, do)
-            Di = tl.load(D_ptrs + offs_m_curr)
-            dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
-            dp += tl.dot(do, tl.trans(v))
-            # compute ds = p * (dp - delta[:, None])
-            ds = p * dp * sm_scale
+            # compute dqkm = dot(v, do)
+            dqkm = tl.dot(do, tl.trans(v))
+            dqk = dqkm * att_mask
+            datt_mask = dqkm * qk
+            ddecay += tl.sum(tl.where(powers > 0, datt_mask * att_mask / decay * (powers - 1), 0))
+            dfirst += tl.sum(tl.where(powers == 0, datt_mask, 0))
             # compute dk = dot(ds.T, q)
-            dk += tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
+            dk += tl.dot(tl.trans(dqk.to(Q.dtype.element_ty)), q)
             # compute dq
             dq = tl.load(dq_ptrs)
-            dq += tl.dot(ds.to(Q.dtype.element_ty), k)
+            dq += tl.dot(dqk.to(Q.dtype.element_ty), k)
             tl.store(dq_ptrs, dq)
             # increment pointers
             dq_ptrs += BLOCK_M * stride_qm
@@ -182,6 +181,8 @@ def _bwd_kernel(
         dk_ptrs = DK + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
         tl.store(dv_ptrs, dv)
         tl.store(dk_ptrs, dk)
+    tl.atomic_add(DDecay + off_h, ddecay)
+    tl.atomic_add(DFirst + off_h, dfirst)
 
 
 empty = torch.empty(128, device="cuda")
@@ -213,7 +214,7 @@ class _attention(torch.autograd.Function):
             num_warps=num_warps,
             num_stages=4)
 
-        ctx.save_for_backward(q, k, v, o)
+        ctx.save_for_backward(q, k, v, o, decay, first)
         ctx.grid = grid
         # ctx.sm_scale = sm_scale
         ctx.BLOCK_DMODEL = Lk
@@ -221,7 +222,28 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        raise NotImplementedError()
+        BLOCK = 128
+        q, k, v, o, decay, first = ctx.saved_tensors
+        do = do.contiguous()
+        dq = torch.zeros_like(q, dtype=torch.float32)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        ddecay = torch.zeros_like(decay)
+        dfirst = torch.zeros_like(first)
+        _bwd_kernel[(ctx.grid[1],)](
+            q, k, v, decay, first,
+            o, do,
+            dq, dk, dv, ddecay, dfirst,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            q.shape[0], q.shape[1], q.shape[2],
+            ctx.grid[0],
+            BLOCK_M=BLOCK, BLOCK_N=BLOCK,
+            BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=8,
+            num_stages=1,
+        )
+        return dq, dk, dv, ddecay, dfirst
 
 
 attention = _attention.apply
@@ -240,23 +262,41 @@ def test_op(Z, H, N_CTX, D_HEAD, dtype=torch.float16):
     r = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
     k = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
     v = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
+    dout = torch.randn_like(r)
     # reference implementation
     att_mask = torch.zeros(H, N_CTX, N_CTX, dtype=dtype, device="cuda")
-    decay = torch.arange(0.9, 0.9 + H * 0.01, 0.01, device='cuda')
-    first = torch.arange(0.95, 0.95 + H * 0.001, 0.001, device='cuda')
+    decay = torch.arange(0.9, 0.9 + H * 0.01, 0.01, device='cuda').requires_grad_()
+    first = torch.arange(0.95, 0.95 + H * 0.001, 0.001, device='cuda').requires_grad_()
     rows, cols = torch.tril_indices(N_CTX, N_CTX, device='cuda')
     powers = rows - cols - 1
     for h in range(H):
         att_mask[h][rows, cols] = (decay[h] ** powers).half()
-        att_mask[h].fill_diagonal_(first[h].item())
+        att_mask[h][range(N_CTX), range(N_CTX)] = first[h].half()
     ref_out = pytorch_mha(r, k, v, att_mask)
+    ref_out.backward(dout)
+    ref_dv, v.grad = v.grad.clone(), None
+    ref_dk, k.grad = k.grad.clone(), None
+    ref_dq, r.grad = r.grad.clone(), None
+    ref_ddecay, decay.grad = decay.grad.clone(), None
+    ref_dfirst, first.grad = first.grad.clone(), None
 
     # triton implementation
     tri_out = attention(r, k, v, decay, first)
+    tri_out.backward(dout)
+    tri_dv, v.grad = v.grad.clone(), None
+    tri_dk, k.grad = k.grad.clone(), None
+    tri_dq, r.grad = r.grad.clone(), None
+    tri_ddecay, decay.grad = decay.grad.clone(), None
+    tri_dfirst, first.grad = first.grad.clone(), None
 
     import pdb; pdb.set_trace()
     # compare
     assert torch.allclose(ref_out, tri_out, atol=5e-2, rtol=2e-3)
+    assert torch.allclose(ref_dv, tri_dv, atol=5e-2, rtol=2e-3)
+    assert torch.allclose(ref_dk, tri_dk, atol=5e-2, rtol=2e-3)
+    assert torch.allclose(ref_dq, tri_dq, atol=5e-2, rtol=2e-3)
+    assert torch.allclose(ref_ddecay, tri_ddecay, atol=5e-2, rtol=1e-2)
+    assert torch.allclose(ref_dfirst, tri_dfirst, atol=5e-2, rtol=2e-2)
 
 
 BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
@@ -314,6 +354,6 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, mode, provider, dtype=torch.f
 
 
 # only works on post-Ampere GPUs right now
-bench_flash_attention.run(save_path='.', print_data=True)
+# bench_flash_attention.run(save_path='.', print_data=True)
 
 
