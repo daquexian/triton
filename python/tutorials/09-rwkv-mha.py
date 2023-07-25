@@ -11,7 +11,7 @@ import triton.language as tl
 
 @triton.jit
 def _fwd_kernel(
-    Q, K, V, Decay, First,
+    Q, K, V, WW, FF,
     Out,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
@@ -58,8 +58,8 @@ def _fwd_kernel(
     # loop over k, v and update accumulator
     lo = 0
     hi = (start_m + 1) * BLOCK_M
-    decay = tl.load(Decay + off_hz % H)
-    first = tl.load(First + off_hz % H)
+    ww = tl.load(WW + off_hz % H)
+    ff = tl.load(FF + off_hz % H)
     for start_n in range(lo, hi, BLOCK_N):
         # -- load k, v --
         k = tl.load(K_block_ptr)
@@ -67,8 +67,8 @@ def _fwd_kernel(
         # -- compute qk ---
         qk = tl.dot(q, k)
         powers = (offs_m[:, None] - (offs_n + start_n)[None, :])
-        att_mask = tl.where(powers > 0, tl.math.fast_powf(decay, powers - 1), 0).to(tl.float16)
-        att_mask += tl.where(powers == 0, first, 0)
+        att_mask = tl.where(powers > 0, tl.math.fast_powf(ww, powers - 1), 0).to(tl.float16)
+        att_mask += tl.where(powers == 0, ff, 0)
         qk *= att_mask
         acc += tl.dot(qk.to(tl.float16), v)
         # update pointers
@@ -89,8 +89,8 @@ def _fwd_kernel(
 
 @triton.jit
 def _bwd_kernel(
-    Q, K, V, Decay, First, Out, DO,
-    DQ, DK, DV, DDecay, DFirst,
+    Q, K, V, WW, FF, Out, DO,
+    DQ, DK, DV, DWW, DFF,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vk, stride_vn,
@@ -103,10 +103,10 @@ def _bwd_kernel(
     off_hz = tl.program_id(0)
     off_z = off_hz // H
     off_h = off_hz % H
-    decay = tl.load(Decay + off_h)
-    first = tl.load(First + off_h)
-    ddecay = 0.
-    dfirst = 0.
+    ww = tl.load(WW + off_h)
+    ff = tl.load(FF + off_h)
+    dww = 0.
+    dff = 0.
     # offset pointers for batch/head
     Q += off_z * stride_qz + off_h * stride_qh
     K += off_z * stride_qz + off_h * stride_qh
@@ -141,8 +141,8 @@ def _bwd_kernel(
             q = tl.load(q_ptrs)
             qk = tl.dot(q, tl.trans(k))
             powers = (offs_m_curr[:, None] - offs_n[None, :])
-            att_mask = tl.where(powers > 0, tl.math.fast_powf(decay, powers - 1), 0).to(tl.float16)
-            att_mask += tl.where(powers == 0, first, 0)
+            att_mask = tl.where(powers > 0, tl.math.fast_powf(ww, powers - 1), 0).to(tl.float16)
+            att_mask += tl.where(powers == 0, ff, 0)
             qkm = qk * att_mask
             # compute dv
             do = tl.load(do_ptrs)
@@ -151,8 +151,8 @@ def _bwd_kernel(
             dqkm = tl.dot(do, tl.trans(v))
             dqk = dqkm * att_mask
             datt_mask = dqkm * qk
-            ddecay += tl.sum(tl.where(powers > 0, datt_mask * att_mask / decay * (powers - 1), 0))
-            dfirst += tl.sum(tl.where(powers == 0, datt_mask, 0))
+            dww += tl.sum(tl.where(powers > 0, datt_mask * att_mask / ww * (powers - 1), 0))
+            dff += tl.sum(tl.where(powers == 0, datt_mask, 0))
             # compute dk = dot(ds.T, q)
             dk += tl.dot(tl.trans(dqk.to(Q.dtype.element_ty)), q)
             # compute dq
@@ -168,14 +168,14 @@ def _bwd_kernel(
         dk_ptrs = DK + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
         tl.store(dv_ptrs, dv)
         tl.store(dk_ptrs, dk)
-    tl.atomic_add(DDecay + off_h, ddecay)
-    tl.atomic_add(DFirst + off_h, dfirst)
+    tl.atomic_add(DWW + off_h, dww)
+    tl.atomic_add(DFF + off_h, dff)
 
 
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, decay, first):
+    def forward(ctx, q, k, v, ww, ff):
         # shape constraints
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Lq == Lk and Lk == Lv
@@ -187,7 +187,7 @@ class _attention(torch.autograd.Function):
 
         num_warps = 4 if Lk <= 64 else 8
         _fwd_kernel[grid](
-            q, k, v, decay, first,
+            q, k, v, ww, ff,
             o,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -198,7 +198,7 @@ class _attention(torch.autograd.Function):
             num_warps=num_warps,
             num_stages=4)
 
-        ctx.save_for_backward(q, k, v, o, decay, first)
+        ctx.save_for_backward(q, k, v, o, ww, ff)
         ctx.grid = grid
         ctx.BLOCK_DMODEL = Lk
         return o
@@ -207,17 +207,17 @@ class _attention(torch.autograd.Function):
     def backward(ctx, do):
         # BLOCK, num_warps and num_stages are got by autotuning on A100
         BLOCK = 64
-        q, k, v, o, decay, first = ctx.saved_tensors
+        q, k, v, o, ww, ff = ctx.saved_tensors
         do = do.contiguous()
         dq = torch.zeros_like(q, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        ddecay = torch.zeros_like(decay)
-        dfirst = torch.zeros_like(first)
+        dww = torch.zeros_like(ww)
+        dff = torch.zeros_like(ff)
         _bwd_kernel[(ctx.grid[1],)](
-            q, k, v, decay, first,
+            q, k, v, ww, ff,
             o, do,
-            dq, dk, dv, ddecay, dfirst,
+            dq, dk, dv, dww, dff,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -226,7 +226,7 @@ class _attention(torch.autograd.Function):
             BLOCK_DMODEL=ctx.BLOCK_DMODEL,
             num_warps=4, num_stages=1,
         )
-        return dq, dk, dv, ddecay, dfirst
+        return dq, dk, dv, dww, dff
 
 
 attention = _attention.apply
@@ -246,39 +246,39 @@ def test_op(Z, H, N_CTX, D_HEAD, dtype=torch.float16):
     k = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
     v = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
     dout = torch.randn_like(r)
-    decay = torch.arange(0.9, 0.9 + H * 0.01, 0.01, device='cuda').requires_grad_()
-    first = torch.arange(0.95, 0.95 + H * 0.001, 0.001, device='cuda').requires_grad_()
+    ww = torch.arange(0.9, 0.9 + H * 0.01, 0.01, device='cuda').requires_grad_()
+    ff = torch.arange(0.95, 0.95 + H * 0.001, 0.001, device='cuda').requires_grad_()
     # reference implementation
     att_mask = torch.zeros(H, N_CTX, N_CTX, dtype=dtype, device="cuda")
     rows, cols = torch.tril_indices(N_CTX, N_CTX, device='cuda')
     powers = rows - cols - 1
     for h in range(H):
-        att_mask[h][rows, cols] = (decay[h] ** powers).half()
-        att_mask[h][range(N_CTX), range(N_CTX)] = first[h].half()
+        att_mask[h][rows, cols] = (ww[h] ** powers).half()
+        att_mask[h][range(N_CTX), range(N_CTX)] = ff[h].half()
     ref_out = pytorch_mha(r, k, v, att_mask)
     ref_out.backward(dout)
     ref_dv, v.grad = v.grad.clone(), None
     ref_dk, k.grad = k.grad.clone(), None
     ref_dq, r.grad = r.grad.clone(), None
-    ref_ddecay, decay.grad = decay.grad.clone(), None
-    ref_dfirst, first.grad = first.grad.clone(), None
+    ref_dww, ww.grad = ww.grad.clone(), None
+    ref_dff, ff.grad = ff.grad.clone(), None
 
     # triton implementation
-    tri_out = attention(r, k, v, decay, first)
+    tri_out = attention(r, k, v, ww, ff)
     tri_out.backward(dout)
     tri_dv, v.grad = v.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
     tri_dq, r.grad = r.grad.clone(), None
-    tri_ddecay, decay.grad = decay.grad.clone(), None
-    tri_dfirst, first.grad = first.grad.clone(), None
+    tri_dww, ww.grad = ww.grad.clone(), None
+    tri_dff, ff.grad = ff.grad.clone(), None
 
     # compare
     assert torch.allclose(ref_out, tri_out, atol=5e-2, rtol=2e-3)
     assert torch.allclose(ref_dv, tri_dv, atol=5e-2, rtol=2e-3)
     assert torch.allclose(ref_dk, tri_dk, atol=5e-2, rtol=2e-3)
     assert torch.allclose(ref_dq, tri_dq, atol=5e-2, rtol=2e-3)
-    assert torch.allclose(ref_ddecay, tri_ddecay, atol=5e-2, rtol=1e-2)
-    assert torch.allclose(ref_dfirst, tri_dfirst, atol=5e-2, rtol=2e-2)
+    assert torch.allclose(ref_dww, tri_dww, atol=5e-2, rtol=1e-2)
+    assert torch.allclose(ref_dff, tri_dff, atol=5e-2, rtol=2e-2)
 
 
 BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
@@ -306,16 +306,16 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, mode, provider, dtype=torch.f
     v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
 
     att_mask = torch.zeros(H, N_CTX, N_CTX, dtype=dtype, device="cuda")
-    decay = torch.arange(0.9, 0.9 + H * 0.01, 0.01, device='cuda')
-    first = torch.arange(0.95, 0.95 + H * 0.001, 0.001, device='cuda')
+    ww = torch.arange(0.9, 0.9 + H * 0.01, 0.01, device='cuda')
+    ff = torch.arange(0.95, 0.95 + H * 0.001, 0.001, device='cuda')
     rows, cols = torch.tril_indices(N_CTX, N_CTX, device='cuda')
     powers = rows - cols - 1
     for h in range(H):
-        att_mask[h][rows, cols] = (decay[h] ** powers).half()
-        att_mask[h].fill_diagonal_(first[h].item())
+        att_mask[h][rows, cols] = (ww[h] ** powers).half()
+        att_mask[h].fill_diagonal_(ff[h].item())
 
     if provider == "triton":
-        fn = lambda: attention(q, k, v, decay, first)
+        fn = lambda: attention(q, k, v, ww, ff)
         if mode == 'bwd':
             o = fn()
             do = torch.randn_like(o)
